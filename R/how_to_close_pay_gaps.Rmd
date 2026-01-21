@@ -1,0 +1,149 @@
+---
+title: "How to close pay gaps"
+output: html_document
+date: "2025-12-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Step 2: Load Data
+```{r}
+# Load employee data
+df <- read.csv('../data/eu_company_pay_data.csv')
+
+# Check structure
+str(df)
+
+# View first few rows
+head(df)
+```
+
+
+## Step 3: Prepare Variables
+```{r}
+# Calculate full-time equivalent total pay
+df$total_pay_fte <- df$total_pay / df$fte
+
+# Create log-transformed pay (for percentage interpretation)
+df$log_pay <- log(df$total_pay_fte)
+```
+
+## Step 4: Set reference values
+```{r}
+# Set Male as reference level for gender
+df$gender <- relevel(factor(df$gender), ref = "Male")
+
+# Determine reference grade by minority count (best gender balance)
+tab <- with(df, table(grade, gender)) 
+minority_counts <- pmin(tab[, "Male"], tab[, "Female"])
+ref_grade <- names(minority_counts)[which.max(minority_counts)]
+
+# Set grade factor with chosen baseline 
+df$grade <- relevel(factor(df$grade), ref = ref_grade) 
+
+# Convert other categorical variables to factors 
+df$job_family <- as.factor(df$job_family) 
+
+# Verify reference levels 
+cat("Gender reference level:", levels(df$gender)[1], "\n") 
+cat("Grade reference level:", levels(df$grade)[1], "\n")
+```
+
+```{r}
+calculate_pay_gap <- function(fit) {
+  # Extract all coefficients into a named vector
+  coefs <- coef(fit)
+  
+  # Main gender effect (reference grade)
+  beta_F <- coefs["genderFemale"]
+  
+  # Identify all grade-specific interaction names
+  int_names <- grep("^genderFemale:grade", names(coefs), value = TRUE)
+  
+  # Subset those interactions; R will give NA for any dropped terms
+  beta_ints <- coefs[int_names]
+  
+  # Reference grade gap
+  gap_ref <- 1 - exp(beta_F)
+  
+  # Other grades: apply interaction adjustment
+  gaps <- sapply(int_names, function(nm) {
+    beta_int <- coefs[nm]
+    if (is.na(beta_int)) {
+      return(NA)
+    }
+    1 - exp(beta_F + beta_int)
+  })
+  
+  # Extract grade names from interaction terms
+  grade_names <- gsub("^genderFemale:grade", "", int_names)
+  
+  # Build results data frame
+  result <- data.frame(
+    Grade = c(ref_grade, grade_names),
+    PayGap_Percent = round(100 * c(gap_ref, gaps), 1),
+    stringsAsFactors = FALSE
+  )
+  
+  return(result)
+}
+```
+
+```{r}
+target_gap <- 5
+fit <- lm(log_pay ~ gender * grade + seniority + job_family, data = df)
+initial_pay_gap <- calculate_pay_gap(fit)
+residuals <- fit$residuals
+```
+
+```{r}
+gmin <- rep(-10, nrow(initial_pay_gap))
+gmax <- rep(10, nrow(initial_pay_gap))
+gamma <- gmin
+targets <- sign(initial_pay_gap$PayGap_Percent) * target_gap
+```
+
+```{r}
+for (j in 1:100) {
+  df$new_log_pay <- df$log_pay
+  for (i in 1:nrow(initial_pay_gap)) {
+    gender_in_scope <- if (initial_pay_gap$PayGap_Percent[i] > 0) {
+      "Female" 
+    } else "Male"
+    idx <- df$grade == initial_pay_gap$Grade[i] & df$gender == gender_in_scope
+    df$new_log_pay[idx] <- df$new_log_pay[idx] + pmax(residuals[idx], gamma[i]) - residuals[idx]
+  }
+  
+  new_fit <- lm(new_log_pay ~ gender * grade + seniority + job_family, data = df)
+  new_pay_gap <- calculate_pay_gap(new_fit)
+  distance <- sign(initial_pay_gap$PayGap_Percent) * (new_pay_gap$PayGap_Percent - targets)
+  
+  overshot <- distance < 0
+  undershot <- distance > 0
+  gmax[overshot] <- gamma[overshot]
+  gmin[undershot] <- gamma[undershot]
+  
+  gamma <- (gmin + gmax) / 2
+}
+```
+
+```{r}
+new_pay_gap
+```
+
+
+```{r}
+df$raise <- round(exp(df$new_log_pay) - df$total_pay_fte, 2)
+df$new_total_pay_fte <- df$total_pay_fte + df$raise
+
+# Cost to close
+sum(df$raise * df$fte)
+
+# Number of raises
+sum(df$raise>0)
+```
+
+
